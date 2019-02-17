@@ -133,9 +133,7 @@ namespace GZipTestApp
             if (String.IsNullOrEmpty(path) || !File.Exists(path))
                 return;
 
-            //byte[] buffer = new byte[BufferSize];
             int read = -1;
-            // поток для чтения исходного файла
             using (FileStream sourceStream = new FileStream(path, FileMode.OpenOrCreate))
             {
                 _fileSize = sourceStream.Length;
