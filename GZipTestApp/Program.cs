@@ -44,6 +44,20 @@ namespace GZipTestApp
             var manager = new GZipManager(Environment.ProcessorCount);
             manager.Start(sourceFile, targetFile, compressionMode);
 
+            int progress = -1;
+            while (!manager.IsCanceled && !manager.IsCompleted)
+            {
+                if (manager.Progress > progress)
+                {
+                    progress = manager.Progress;
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss}. Progress {progress}%");
+                }
+            }
+
+            GC.Collect();
+            Console.WriteLine($"File process " +
+                              $"{(manager.IsCanceled ? "canceled" : manager.IsCompleted ? "completed" : "")}");
+
             while (true)
             {
                 Console.WriteLine("Press Ctrl+C to exit");
