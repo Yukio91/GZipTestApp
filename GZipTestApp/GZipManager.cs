@@ -9,7 +9,7 @@ namespace GZipTestApp
 {
     public class GZipManager
     {
-        private const int BufferSize = 1024 * 1024 * 10; //10MB
+        private const int BufferSize = 1024 * 1024 * 100; //100MB
 
         private long _fileSize;
         private int _readCount;
@@ -70,6 +70,14 @@ namespace GZipTestApp
 
             try
             {
+                sourceFile = sourceFile.Trim();
+                if (String.IsNullOrEmpty(sourceFile) || !File.Exists(sourceFile))
+                    throw new Exception(nameof(sourceFile));
+
+                targetFile = targetFile.Trim();
+                if (String.IsNullOrEmpty(targetFile))
+                    throw new ArgumentNullException(nameof(targetFile));
+
                 _readerQueue.Clear();
                 _writerQueue.Clear();
 
@@ -123,8 +131,8 @@ namespace GZipTestApp
                             byte[] buffer;
                             var offset = 0;
 
-                            long leftSize = sourceStream.Length - sourceStream.Position;
-                            if (leftSize == 0)
+                            long leftSize = _fileSize - sourceStream.Position;
+                            if (leftSize <= 0)
                                 return;
 
                             int bufferSize = leftSize <= BufferSize ? (int) leftSize : BufferSize;
@@ -147,7 +155,7 @@ namespace GZipTestApp
                             else buffer = new byte[bufferSize];
 
                             read = sourceStream.Read(buffer, offset, bufferSize);
-                            _progress = (int) (((double) sourceStream.Position / _fileSize) * 100);
+                            _progress = (int) ((double) sourceStream.Position / _fileSize * 100);
 
                             _readerQueue.Enqueue(new ByteBlock(_readCount, buffer));
                             _readCount++;
