@@ -9,7 +9,7 @@ namespace GZipTestApp
 {
     public class GZipManager
     {
-        private const int BufferSize = 1024 * 1024 * 100; //100MB
+        private const int BufferSize = 1024 * 1024 * 10; //10MB
 
         private long _fileSize;
         private int _readCount;
@@ -21,7 +21,8 @@ namespace GZipTestApp
         private readonly Thread[] _workers;
         private readonly int _workersCount;
 
-        protected readonly object LockObject = new object();
+        protected readonly object ReaderLockObject = new object();
+        protected readonly object WriterLockObject = new object();
 
         private CompressionMode _compressionMode;
         private bool _completed;
@@ -123,43 +124,47 @@ namespace GZipTestApp
 
                     do
                     {
-                        lock (LockObject)
+                        lock (ReaderLockObject)
                         {
                             if (_readerQueue.Count > _workersCount - 1)
                                 continue;
+                        }
 
-                            byte[] buffer;
-                            var offset = 0;
+                        byte[] buffer;
+                        var offset = 0;
 
-                            long leftSize = _fileSize - sourceStream.Position;
-                            if (leftSize <= 0)
-                                return;
+                        long leftSize = _fileSize - sourceStream.Position;
+                        if (leftSize <= 0)
+                            return;
 
-                            int bufferSize = leftSize <= BufferSize ? (int) leftSize : BufferSize;
-                            if (_compressionMode == CompressionMode.Decompress)
-                            {
-                                byte[] lengthBuffer = new byte[8];
-                                sourceStream.Read(lengthBuffer, 0, lengthBuffer.Length);
-                                bufferSize = BitConverter.ToInt32(lengthBuffer, 4);
-                                if (bufferSize <= 0)
-                                    break;
+                        int bufferSize = leftSize <= BufferSize ? (int) leftSize : BufferSize;
+                        if (_compressionMode == CompressionMode.Decompress)
+                        {
+                            byte[] lengthBuffer = new byte[8];
+                            sourceStream.Read(lengthBuffer, 0, lengthBuffer.Length);
+                            bufferSize = BitConverter.ToInt32(lengthBuffer, 4);
+                            if (bufferSize <= 0)
+                                break;
 
-                                Array.Clear(lengthBuffer, 4, 4);
+                            Array.Clear(lengthBuffer, 4, 4);
 
-                                buffer = new byte[bufferSize];
-                                lengthBuffer.CopyTo(buffer, 0);
+                            buffer = new byte[bufferSize];
+                            lengthBuffer.CopyTo(buffer, 0);
 
-                                bufferSize -= 8;
-                                offset = 8;
-                            }
-                            else buffer = new byte[bufferSize];
+                            bufferSize -= 8;
+                            offset = 8;
+                        }
+                        else buffer = new byte[bufferSize];
 
-                            read = sourceStream.Read(buffer, offset, bufferSize);
-                            _progress = (int) ((double) sourceStream.Position / _fileSize * 100);
+                        read = sourceStream.Read(buffer, offset, bufferSize);
+                        _progress = (int) ((double) sourceStream.Position / _fileSize * 100);
 
+                        lock (ReaderLockObject)
+                        {
                             _readerQueue.Enqueue(new ByteBlock(_readCount, buffer));
                             _readCount++;
                         }
+
                     } while (read > 0);
                 }
             }
@@ -188,14 +193,15 @@ namespace GZipTestApp
                     File.Delete(path);
                 }
 
-                using (FileStream targetStream = new FileStream(path, FileMode.OpenOrCreate))
+                using (FileStream targetStream = new FileStream(path, FileMode.Append))
                 {
                     _writeCount = 0;
                     var list = new List<ByteBlock>();
 
                     while (true)
                     {
-                        lock (LockObject)
+                        ByteBlock block;
+                        lock (WriterLockObject)
                         {
                             if (_writerQueue.Count == 0)
                             {
@@ -205,37 +211,38 @@ namespace GZipTestApp
                                 continue;
                             }
 
-                            var block = _writerQueue.Dequeue();
+                            block = _writerQueue.Dequeue();
+                        }
 
-                            if (block == null)
-                                return;
+                        if (block == null)
+                            return;
 
-                            if (block.Id > _writeCount && list.Count > 0)
+                        if (block.Id > _writeCount && list.Count > 0)
+                        {
+                            var sorted = list.OrderBy(b => b.Id).ToList();
+                            for (int i = 0; i < sorted.Count; i++)
                             {
-                                var sorted = list.OrderBy(b => b.Id).ToList();
-                                for (int i = 0; i < sorted.Count; i++)
-                                {
-                                    if (block.Id == _writeCount)
-                                        break;
+                                if (block.Id == _writeCount)
+                                    break;
 
-                                    targetStream.Write(sorted[i].Buffer, 0, sorted[i].Buffer.Length);
-                                    targetStream.Flush();
-
-                                    _writeCount++;
-
-                                    list.Remove(sorted[i]);
-                                }
-                            }
-
-                            if (block.Id == _writeCount)
-                            {
-                                targetStream.Write(block.Buffer, 0, block.Buffer.Length);
+                                targetStream.Write(sorted[i].Buffer, 0, sorted[i].Buffer.Length);
                                 targetStream.Flush();
 
                                 _writeCount++;
+
+                                list.Remove(sorted[i]);
                             }
-                            else list.Add(block);
                         }
+
+                        if (block.Id == _writeCount)
+                        {
+                            targetStream.Write(block.Buffer, 0, block.Buffer.Length);
+                            targetStream.Flush();
+
+                            _writeCount++;
+                        }
+                        else list.Add(block);
+
                     }
                 }
             }
@@ -256,7 +263,8 @@ namespace GZipTestApp
             {
                 while (true)
                 {
-                    lock (LockObject)
+                    ByteBlock block;
+                    lock (ReaderLockObject)
                     {
                         if (_readerQueue.Count == 0)
                         {
@@ -266,15 +274,18 @@ namespace GZipTestApp
                             continue;
                         }
 
-                        var block = _readerQueue.Dequeue();
+                        block = _readerQueue.Dequeue();
+                    }
 
-                        if (block == null)
-                            continue;
+                    if (block == null)
+                        continue;
 
-                        var buffer = _compressionMode == CompressionMode.Compress
-                            ? GZipHelper.CompressBlock(block.Buffer)
-                            : GZipHelper.DecompressBlock(block.Buffer);
+                    var buffer = _compressionMode == CompressionMode.Compress
+                        ? GZipHelper.CompressBlock(block.Buffer)
+                        : GZipHelper.DecompressBlock(block.Buffer);
 
+                    lock (WriterLockObject)
+                    {
                         _writerQueue.Enqueue(new ByteBlock(block.Id, buffer));
                     }
                 }
