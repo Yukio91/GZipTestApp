@@ -12,11 +12,13 @@ namespace GZipTestApp
         private const int BufferSize = 1024 * 1024 * 10; //10MB
 
         private long _fileSize;
-        private int _readCount;
-        private int _writeCount;
 
-        private readonly Queue<ByteBlock> _readerQueue = new Queue<ByteBlock>();
-        private readonly Queue<ByteBlock> _writerQueue = new Queue<ByteBlock>();
+        //private int _readCount;
+        private int _writeCount;
+        private int _blockCount;
+
+        private ConcurrentQueue<ByteBlock> _readerQueue;
+        private ConcurrentQueue<ByteBlock> _writerQueue;
 
         private readonly Thread[] _workers;
         private readonly int _workersCount;
@@ -79,8 +81,8 @@ namespace GZipTestApp
                 if (String.IsNullOrEmpty(targetFile))
                     throw new ArgumentNullException(nameof(targetFile));
 
-                _readerQueue.Clear();
-                _writerQueue.Clear();
+                _readerQueue = new ConcurrentQueue<ByteBlock>(_workersCount);
+                _writerQueue = new ConcurrentQueue<ByteBlock>(_workersCount);
 
                 Console.WriteLine($"Start {(mode == CompressionMode.Compress ? "compress" : "decompress")} file");
                 Console.WriteLine($"Buffer size: {BufferSize}");
@@ -119,16 +121,14 @@ namespace GZipTestApp
                 using (FileStream sourceStream = new FileStream(path, FileMode.OpenOrCreate))
                 {
                     _fileSize = sourceStream.Length;
-                    _readCount = 0;
+                    int readCount = 0;
                     _progress = 0;
 
                     do
                     {
-                        lock (ReaderLockObject)
-                        {
-                            if (_readerQueue.Count > _workersCount - 1)
-                                continue;
-                        }
+                        read = 1;
+                        if (_readerQueue.Count >= _workersCount)
+                            continue;
 
                         byte[] buffer;
                         var offset = 0;
@@ -157,13 +157,10 @@ namespace GZipTestApp
                         else buffer = new byte[bufferSize];
 
                         read = sourceStream.Read(buffer, offset, bufferSize);
-                        _progress = (int) ((double) sourceStream.Position / _fileSize * 100);
+                        _progress = (int) ((double) sourceStream.Position / _fileSize * 90);
 
-                        lock (ReaderLockObject)
-                        {
-                            _readerQueue.Enqueue(new ByteBlock(_readCount, buffer));
-                            _readCount++;
-                        }
+                        _readerQueue.Enqueue(new ByteBlock(readCount, buffer));
+                        readCount++;
 
                     } while (read > 0);
                 }
@@ -176,7 +173,7 @@ namespace GZipTestApp
             }
             finally
             {
-                _completed = true;
+                _readerQueue.Close();
             }
         }
 
@@ -197,53 +194,30 @@ namespace GZipTestApp
                 {
                     _writeCount = 0;
                     var list = new List<ByteBlock>();
-
-                    while (true)
+                    while (!_canceled)
                     {
                         ByteBlock block;
-                        lock (WriterLockObject)
+                        if (list.Count > 0 && (block = list.OrderBy(b => b.Id).FirstOrDefault())?.Id == _writeCount)
                         {
-                            if (_writerQueue.Count == 0)
-                            {
-                                if (_completed)
-                                    break;
+                            list.Remove(block);
+                        }
+                        else if (!_writerQueue.TryDequeue(out block))
+                            break;
 
-                                continue;
-                            }
-
-                            block = _writerQueue.Dequeue();
+                        if (block?.Id != _writeCount)
+                        {
+                            list.Add(block);
+                            continue;
                         }
 
-                        if (block == null)
-                            return;
+                        targetStream.Write(block.Buffer, 0, block.Buffer.Length);
+                        targetStream.Flush();
 
-                        if (block.Id > _writeCount && list.Count > 0)
-                        {
-                            var sorted = list.OrderBy(b => b.Id).ToList();
-                            for (int i = 0; i < sorted.Count; i++)
-                            {
-                                if (block.Id == _writeCount)
-                                    break;
-
-                                targetStream.Write(sorted[i].Buffer, 0, sorted[i].Buffer.Length);
-                                targetStream.Flush();
-
-                                _writeCount++;
-
-                                list.Remove(sorted[i]);
-                            }
-                        }
-
-                        if (block.Id == _writeCount)
-                        {
-                            targetStream.Write(block.Buffer, 0, block.Buffer.Length);
-                            targetStream.Flush();
-
-                            _writeCount++;
-                        }
-                        else list.Add(block);
-
+                        _writeCount++;
                     }
+
+                    _progress = 100;
+                    //Console.WriteLine($"{DateTime.Now:HH:mm:ss}. Write completed");
                 }
             }
             catch (Exception ex)
@@ -252,8 +226,13 @@ namespace GZipTestApp
 
                 _canceled = true;
             }
+            finally
+            {
+                _completed = true;
+            }
         }
 
+        private bool _closeWorkers;
         private void Process(object number)
         {
             if (_fileSize <= 0)
@@ -261,20 +240,19 @@ namespace GZipTestApp
 
             try
             {
-                while (true)
+                int lastBlockId = -1;
+                while (!_canceled && !_closeWorkers)
                 {
+                    if (lastBlockId > _writeCount)
+                        continue;
+
                     ByteBlock block;
-                    lock (ReaderLockObject)
+                    if (!_readerQueue.TryDequeue(out block))
                     {
-                        if (_readerQueue.Count == 0)
-                        {
-                            if (_completed)
-                                break;
+                        _writerQueue.Close();
+                        _closeWorkers = true;
 
-                            continue;
-                        }
-
-                        block = _readerQueue.Dequeue();
+                        break;
                     }
 
                     if (block == null)
@@ -284,10 +262,9 @@ namespace GZipTestApp
                         ? GZipHelper.CompressBlock(block.Buffer)
                         : GZipHelper.DecompressBlock(block.Buffer);
 
-                    lock (WriterLockObject)
-                    {
-                        _writerQueue.Enqueue(new ByteBlock(block.Id, buffer));
-                    }
+                    lastBlockId = block.Id;
+
+                    _writerQueue.Enqueue(new ByteBlock(block.Id, buffer));
                 }
             }
             catch (Exception ex)
@@ -295,6 +272,10 @@ namespace GZipTestApp
                 Console.WriteLine($"Error in thread {number}. Message: {ex.Message}");
 
                 _canceled = true;
+            }
+            finally
+            {
+                Console.WriteLine($"Close thread {number}");
             }
         }
     }

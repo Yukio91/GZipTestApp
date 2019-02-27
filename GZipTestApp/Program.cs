@@ -41,10 +41,9 @@ namespace GZipTestApp
                     return;
             }
 
-            var manager = new GZipManager(4);//Environment.ProcessorCount);
+            var manager = new GZipManager(Environment.ProcessorCount);
             if (manager.Start(sourceFile, targetFile, compressionMode))
             {
-
                 int progress = -1;
                 while (!manager.IsCanceled && !manager.IsCompleted)
                 {
