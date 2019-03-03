@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Threading;
+using GZipTestApp.Log;
 
 namespace GZipTestApp
 {
@@ -23,7 +24,7 @@ namespace GZipTestApp
         private readonly Thread[] _workers;
         private readonly int _workersCount;
 
-        protected readonly object ReaderLockObject = new object();
+        //protected readonly object ReaderLockObject = new object();
         protected readonly object WriterLockObject = new object();
 
         private CompressionMode _compressionMode;
@@ -31,23 +32,27 @@ namespace GZipTestApp
         private bool _canceled;
         private int _progress;
 
+        private readonly ILogger _logger;
+
         public int Progress => _progress;
         public bool IsCanceled => _canceled;
         public bool IsCompleted => _completed;
 
-        public GZipManager(int threadsCount)
+        public GZipManager(int threadsCount, ILogger logger = null)
         {
             if (threadsCount <= 0)
                 throw new Exception(nameof(threadsCount));
 
             _workersCount = threadsCount;
             _workers = new Thread[threadsCount];
+
+            _logger = logger;
         }
 
-        public bool Stop()
+        public void Close()
         {
             if ((_workers?.Length ?? 0) == 0)
-                return false;
+                return;
 
             for (int i = 0; i < _workers.Length; i++)
             {
@@ -57,14 +62,13 @@ namespace GZipTestApp
                         _workers[i]?.Join();
 
                     _workers[i] = null;
+                    //_logger?.Write($"Close thread {i}");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine(ex.Message);
+                    _logger?.Error($"Close thread {i} failed", ex);
                 }
             }
-
-            return true;
         }
 
         public bool Start(string sourceFile, string targetFile, CompressionMode mode)
@@ -84,8 +88,8 @@ namespace GZipTestApp
                 _readerQueue = new ConcurrentQueue<ByteBlock>(_workersCount);
                 _writerQueue = new ConcurrentQueue<ByteBlock>(_workersCount);
 
-                Console.WriteLine($"Start {(mode == CompressionMode.Compress ? "compress" : "decompress")} file");
-                Console.WriteLine($"Buffer size: {BufferSize}");
+                _logger?.Write($"Start {(mode == CompressionMode.Compress ? "compress" : "decompress")} file");
+                _logger?.Write($"Buffer size: {BufferSize}");
 
                 var readFileThread = new Thread(Read);
                 readFileThread.Start(sourceFile);
@@ -103,7 +107,7 @@ namespace GZipTestApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Start failed. Error: {ex.Message}");
+                _logger?.Error("Start failed", ex);
 
                 return false;
             }
@@ -115,15 +119,15 @@ namespace GZipTestApp
             if (String.IsNullOrEmpty(path) || !File.Exists(path))
                 return;
 
-            int read = -1;
             try
             {
-                using (FileStream sourceStream = new FileStream(path, FileMode.OpenOrCreate))
+                using (FileStream sourceStream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Read))
                 {
                     _fileSize = sourceStream.Length;
                     int readCount = 0;
                     _progress = 0;
 
+                    int read;
                     do
                     {
                         read = 1;
@@ -167,7 +171,7 @@ namespace GZipTestApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Read File Error. Message: {ex.Message}");
+                _logger?.Error("Read File failed", ex);
 
                 _canceled = true;
             }
@@ -190,39 +194,45 @@ namespace GZipTestApp
                     File.Delete(path);
                 }
 
-                using (FileStream targetStream = new FileStream(path, FileMode.Append))
+                using (var targetStream = new FileStream(path, FileMode.Append, FileAccess.Write))
                 {
-                    _writeCount = 0;
-                    var list = new List<ByteBlock>();
-                    while (!_canceled)
+                    using (var bs = new BufferedStream(targetStream))
                     {
-                        ByteBlock block;
-                        if (list.Count > 0 && (block = list.OrderBy(b => b.Id).FirstOrDefault())?.Id == _writeCount)
+                        _writeCount = 0;
+                        var list = new List<ByteBlock>();
+                        while (!_canceled)
                         {
-                            list.Remove(block);
+                            ByteBlock block;
+                            if (list.Count > 0 && (block = list.OrderBy(b => b.Id).FirstOrDefault())?.Id ==
+                                _writeCount)
+                            {
+                                list.Remove(block);
+                            }
+                            else if (!_writerQueue.TryDequeue(out block))
+                                break;
+
+                            if (block?.Id != _writeCount)
+                            {
+                                list.Add(block);
+                                continue;
+                            }
+
+                            //_logger?.Write($"Write block {block.Id}, queue: {list.Count}");
+
+                            bs.Write(block.Buffer, 0, block.Buffer.Length);
+                            bs.Flush();
+                            
+                            lock (WriterLockObject)
+                                _writeCount++;
                         }
-                        else if (!_writerQueue.TryDequeue(out block))
-                            break;
-
-                        if (block?.Id != _writeCount)
-                        {
-                            list.Add(block);
-                            continue;
-                        }
-
-                        targetStream.Write(block.Buffer, 0, block.Buffer.Length);
-                        targetStream.Flush();
-
-                        _writeCount++;
                     }
-
-                    _progress = 100;
-                    //Console.WriteLine($"{DateTime.Now:HH:mm:ss}. Write completed");
                 }
+
+                _progress = 100;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Write file Error. Message: {ex.Message}");
+                _logger?.Error("Write file failed", ex);
 
                 _canceled = true;
             }
@@ -243,8 +253,11 @@ namespace GZipTestApp
                 int lastBlockId = -1;
                 while (!_canceled && !_closeWorkers)
                 {
-                    if (lastBlockId > _writeCount)
-                        continue;
+                    lock (WriterLockObject)
+                    {
+                        if (lastBlockId > _writeCount)
+                            continue;
+                    }
 
                     ByteBlock block;
                     if (!_readerQueue.TryDequeue(out block))
@@ -264,18 +277,20 @@ namespace GZipTestApp
 
                     lastBlockId = block.Id;
 
+                    //_logger?.Write($"{_compressionMode}, block {lastBlockId}, thread {number}");
+
                     _writerQueue.Enqueue(new ByteBlock(block.Id, buffer));
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in thread {number}. Message: {ex.Message}");
+                _logger?.Error($"Error in thread {number}", ex);
 
                 _canceled = true;
             }
             finally
             {
-                Console.WriteLine($"Close thread {number}");
+                _logger?.Write($"Close thread {number}");
             }
         }
     }

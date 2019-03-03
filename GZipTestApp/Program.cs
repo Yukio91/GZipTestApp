@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO.Compression;
+using GZipTestApp.Log;
 
 namespace GZipTestApp
 {
@@ -41,7 +42,8 @@ namespace GZipTestApp
                     return;
             }
 
-            var manager = new GZipManager(Environment.ProcessorCount);
+            var logger = new ConsoleLogger();
+            var manager = new GZipManager(Environment.ProcessorCount, logger);
             if (manager.Start(sourceFile, targetFile, compressionMode))
             {
                 int progress = -1;
@@ -50,12 +52,14 @@ namespace GZipTestApp
                     if (manager.Progress > progress)
                     {
                         progress = manager.Progress;
-                        Console.WriteLine($"{DateTime.Now:HH:mm:ss}. Progress {progress}%");
+                        logger.Write($"Progress {progress}%");
                     }
                 }
 
+                //manager.Close();
+
                 GC.Collect();
-                Console.WriteLine($"File process " +
+                logger.Write($"File process " +
                                   $"{(manager.IsCanceled ? "canceled" : manager.IsCompleted ? "completed" : "")}");
             }
 
